@@ -1,10 +1,9 @@
 #include <XnOpenNI.h>
 #include <XnCodecIDs.h>
 #include <XnCppWrapper.h>
-#include "SceneDrawer.h"
-#include "dprintf.h"
-#include <mmsystem.h>
 #include <cmath>
+#include "sndfile.h"
+#include "portaudio.h"
 
 #pragma comment(lib,"winmm")
 
@@ -37,7 +36,15 @@ XnChar g_strPose[20] = "";
 XnBool g_bPrintID = TRUE;
 XnBool g_bPrintState = TRUE;
 
-#include <GL/glut.h>
+#ifndef USE_GLES
+#if (XN_PLATFORM == XN_PLATFORM_MACOSX)
+	#include <GLUT/glut.h>
+#else
+	#include <GL/glut.h>
+#endif
+#else
+	#include "opengles.h"
+#endif
 
 #define GL_WIN_SIZE_X 720
 #define GL_WIN_SIZE_Y 480
@@ -47,8 +54,121 @@ XnBool g_bRecord = false;
 
 XnBool g_bQuit = false;
 
-MCI_OPEN_PARMS g_mop_kame1;
-MCI_OPEN_PARMS g_mop_kame2;
+// audio
+struct OurData
+{
+  SNDFILE *sndFile;
+  SF_INFO sfInfo;
+  int position;
+  bool loop;
+  bool playing;
+};
+
+PaStream *bgmStream;
+PaStream *sndStream;
+OurData *bgmData;
+OurData *kamehamehaData1;
+OurData *kamehamehaData2;
+
+
+int PaCallback(const void *input,
+             void *output,
+             unsigned long frameCount,
+             const PaStreamCallbackTimeInfo* paTimeInfo,
+             PaStreamCallbackFlags statusFlags,
+             void *userData)
+{
+  OurData *data = (OurData *)userData; /* we passed a data structure
+into the callback so we have something to work with */
+  int *cursor; /* current pointer into the output  */
+  int *out = (int *)output;
+  int thisSize = frameCount;
+  int thisRead;
+  bool finished = false;
+
+  cursor = out; /* set the output cursor to the beginning */
+  while (thisSize > 0)
+  {
+    /* seek to our current file position */
+    sf_seek(data->sndFile, data->position, SEEK_SET);
+
+    /* are we going to read past the end of the file?*/
+    if (thisSize > (data->sfInfo.frames - data->position))
+    {
+      /*if we are, only read to the end of the file*/
+      thisRead = data->sfInfo.frames - data->position;
+      /* and then loop to the beginning of the file */
+      if (data->loop) {
+        data->position = 0;
+  	  } else {
+  	  	data->position = data->sfInfo.frames;
+  	  	finished = true;
+  	  	data->playing = false;
+  	  }
+    }
+    else
+    {
+      /* otherwise, we'll just fill up the rest of the output buffer */
+      thisRead = thisSize;
+      /* and increment the file position */
+      data->position += thisRead;
+    }
+
+    /* since our output format and channel interleaving is the same as
+sf_readf_int's requirements */
+    /* we'll just read straight into the output buffer */
+    sf_readf_int(data->sndFile, cursor, thisRead);
+    /* increment the output cursor*/
+    cursor += thisRead;
+    /* decrement the number of samples left to process */
+    thisSize -= thisRead;
+  }
+
+  if (!finished) {
+  	return paContinue;
+  } else {
+  	return paComplete;
+  }
+}
+
+void openData(OurData* data, char* file, bool loop) {
+	data = (OurData *)malloc(sizeof(OurData));
+	data->position = 0;
+	data->sfInfo.format = 0;
+	data->loop = loop;
+	data->playing = false;
+	data->sndFile = sf_open(file, SFM_READ, &data->sfInfo);
+}
+
+void startStream(OurData* data, PaStream* stream) {
+	data->position = 0;
+	data->playing = true;
+
+	PaStreamParameters outputParameters;
+	outputParameters.device = Pa_GetDefaultOutputDevice();
+	outputParameters.channelCount = data->sfInfo.channels;
+	outputParameters.sampleFormat = paInt16;
+	outputParameters.suggestedLatency = 0.2;
+	outputParameters.hostApiSpecificStreamInfo = 0;
+
+	PaError error = Pa_OpenStream(&stream,
+		0, &outputParameters,
+		data->sfInfo.samplerate, paFramesPerBufferUnspecified,
+		paNoFlag, PaCallback, data);
+
+	if (error) {
+		printf("error opening output, error code = %i\n", error);
+		Pa_Terminate();
+		return;
+	}
+
+	Pa_StartStream(stream);
+}
+
+void stopStream(PaStream* stream) {
+	Pa_StopStream(stream);
+	// data->playing = false;
+}
 
 //---------------------------------------------------------------------------
 // Code
@@ -459,9 +579,15 @@ void glutDisplay (void)
 					if (!kameStarted){
 						time(&kameStart);
 						kameStarted=true;
-						mciSendCommand(g_mop_kame1.wDeviceID,MCI_STOP,0,0);
-						mciSendCommand(g_mop_kame1.wDeviceID,MCI_SEEK,MCI_SEEK_TO_START,0);
-						mciSendCommand(g_mop_kame1.wDeviceID, MCI_PLAY, 0, 0);
+						// TODO
+						// mciSendCommand(g_mop_kame1.wDeviceID,MCI_STOP,0,0);
+						// mciSendCommand(g_mop_kame1.wDeviceID,MCI_SEEK,MCI_SEEK_TO_START,0);
+						// mciSendCommand(g_mop_kame1.wDeviceID, MCI_PLAY, 0, 0);
+						if (kamehamehaData1->playing) {
+							stopStream(sndStream);
+							Pa_Sleep(100);
+						}
+						startStream(kamehamehaData1, sndStream);
 					}else{
 						time(&current);
 						int diff = (int)difftime(current, kameStart);
@@ -481,18 +607,25 @@ void glutDisplay (void)
 						if(abs(ld - PI)<0.5){
 							printf("ha!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
 
-							DWORD            dwSecond;
-							MCI_STATUS_PARMS mciStatus;
+							// TODO
+							// MCI_STATUS_PARMS mciStatus;
 
-							mciStatus.dwItem = MCI_STATUS_MODE;
-							mciSendCommand(g_mop_kame2.wDeviceID, MCI_STATUS, MCI_STATUS_ITEM, (DWORD_PTR)&mciStatus);
+							// mciStatus.dwItem = MCI_STATUS_MODE;
+							// mciSendCommand(g_mop_kame2.wDeviceID, MCI_STATUS, MCI_STATUS_ITEM, (DWORD_PTR)&mciStatus);
 							
-							if (mciStatus.dwReturn != MCI_MODE_PLAY){
-								mciSendCommand(g_mop_kame2.wDeviceID,MCI_STOP,0,0);
-								mciSendCommand(g_mop_kame2.wDeviceID,MCI_SEEK,MCI_SEEK_TO_START,0);
-								mciSendCommand(g_mop_kame2.wDeviceID, MCI_PLAY, 0, 0);
+							// if (mciStatus.dwReturn != MCI_MODE_PLAY){
+							// 	mciSendCommand(g_mop_kame2.wDeviceID,MCI_STOP,0,0);
+							// 	mciSendCommand(g_mop_kame2.wDeviceID,MCI_SEEK,MCI_SEEK_TO_START,0);
+							// 	mciSendCommand(g_mop_kame2.wDeviceID, MCI_PLAY, 0, 0);
+							// }
+							// mciSendCommand(g_mop_kame1.wDeviceID,MCI_STOP,0,0);
+							if (kamehamehaData1->playing) {
+								stopStream(sndStream);
+								Pa_Sleep(100);
 							}
-							mciSendCommand(g_mop_kame1.wDeviceID,MCI_STOP,0,0);
+							if (!kamehamehaData2->playing) {
+								startStream(kamehamehaData2, sndStream);
+							}
 
 							XnPoint3D pts[2];
 							XnPoint3D tpoints[2] = {jointLe.position, jointLs.position};
@@ -576,20 +709,29 @@ int main(int argc, char **argv)
 {
 	printf("start\n");
 
-	static MCI_OPEN_PARMS mop;
+	// TODO
+	// static MCI_OPEN_PARMS mop;
 
-	mop.lpstrDeviceType=TEXT("WaveAudio");
-	mop.lpstrElementName=TEXT("dragon_bgm.wav");
-	mciSendCommand(NULL,MCI_OPEN,MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,(DWORD)&mop);
-	mciSendCommand(mop.wDeviceID,MCI_PLAY,0,0);
+	// mop.lpstrDeviceType=TEXT("WaveAudio");
+	// mop.lpstrElementName=TEXT("dragon_bgm.wav");
+	// mciSendCommand(NULL,MCI_OPEN,MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,(DWORD)&mop);
+	// mciSendCommand(mop.wDeviceID,MCI_PLAY,0,0);
 
-	g_mop_kame1.lpstrDeviceType=TEXT("WaveAudio");
-	g_mop_kame1.lpstrElementName=TEXT("kamehameha_1.wav");
-	mciSendCommand(NULL,MCI_OPEN,MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,(DWORD)&g_mop_kame1);
+	// g_mop_kame1.lpstrDeviceType=TEXT("WaveAudio");
+	// g_mop_kame1.lpstrElementName=TEXT("kamehameha_1.wav");
+	// mciSendCommand(NULL,MCI_OPEN,MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,(DWORD)&g_mop_kame1);
 
-	g_mop_kame2.lpstrDeviceType=TEXT("WaveAudio");
-	g_mop_kame2.lpstrElementName=TEXT("kamehameha_2.wav");
-	mciSendCommand(NULL,MCI_OPEN,MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,(DWORD)&g_mop_kame2);
+	// g_mop_kame2.lpstrDeviceType=TEXT("WaveAudio");
+	// g_mop_kame2.lpstrElementName=TEXT("kamehameha_2.wav");
+	// mciSendCommand(NULL,MCI_OPEN,MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,(DWORD)&g_mop_kame2);
+
+	Pa_Initialize();
+
+	openData(bgmData, "dragon_bgm.wav", true);
+	openData(kamehamehaData1, "kamehameha_1.wav", false);
+	openData(kamehamehaData2, "kamehameha_2.wav", false);
+
+	startStream(bgmData, bgmStream);
 
 	XnStatus nRetVal = XN_STATUS_OK;
 

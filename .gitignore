@@ -23,3 +23,6 @@ Thumbs.db
 *.mp3
 
 ipch
+
+x64-Release/
+x64-Debug/
